@@ -1,0 +1,7 @@
+/.vs
+/.vscode
+/build
+/dist
+/field_ops.egg-info
+/my_cuda_extension.egg-info
+/venv
