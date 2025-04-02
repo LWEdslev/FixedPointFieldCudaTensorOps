@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-#define BLOCK_SIZE 16
-#define TILE_SIZE 16
+#define BLOCK_SIZE 8
+#define TILE_SIZE 8
 
 constexpr int64_t n64 = 8;
 constexpr int64_t p64 = (((int64_t)2) << 31) - 1;
