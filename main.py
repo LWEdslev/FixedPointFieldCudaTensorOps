@@ -2,30 +2,45 @@ import time
 import torch
 import field_ops  # Import your compiled CUDA extension
 
-M, K, N = 4096, 4096, 4096  # Example sizes
+k = 10
 
-A = torch.randn(M, K, dtype=torch.double, device="cuda")
-B = torch.randn(K, N, dtype=torch.double, device="cuda")
+M, K, N = 1 << k, 1 << k, 1 << k
 
-print('Expected result:\n', A @ B)
+A = (torch.rand(M, K, dtype=torch.double, device="cuda") - 0.5) * 20 # uniform in [-10, 10]
+B = (torch.rand(K, N, dtype=torch.double, device="cuda") - 0.5) * 20 # uniform in [-10, 10]
+Af = A.float()
+Bf = A.float()
+torch.cuda.synchronize()
+start_time = time.time()
+expected = A @ B
+torch.cuda.synchronize()
+#print(expected)
+time_taken_1 = time.time() - start_time
+print(f"Operations took: {time_taken_1} seconds")
 
-A = field_ops.encode_to_field_int64(A)
-B = field_ops.encode_to_field_int64(B)
+print('Expected result:\n', expected)
 
+A = field_ops.encode_to_field_int32(A)
+B = field_ops.encode_to_field_int32(B)
+torch.cuda.synchronize()
 
 # Perform and time first matrix multiplication
 start_time = time.time()
-C = field_ops.field_matmul_int64(A, B)
+C = field_ops.field_matmul_int32(A, B)
 time_taken_1 = time.time() - start_time
 
-C = field_ops.decode_from_field_int64(C)
+C = field_ops.decode_from_field_int32(C)
 
 # Print results
 #print("Matrix A:\n", A.cpu().numpy())
 #print("Matrix B:\n", B.cpu().numpy())
 print("Result:\n", C)
-print(f"GPU matmul: {time_taken_1} seconds")
+print(f"Operations took: {time_taken_1} seconds")
 
+e = C - expected
+ae = torch.abs(e)
+mae = torch.mean(ae).item()
+print('MAE:', mae)
 # Perform and time second matrix multiplication
 #A = A.cpu()
 #B = B.cpu()
