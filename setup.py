@@ -7,7 +7,7 @@ setup(
         CUDAExtension(
             "field_ops",
             ["my_kernel.cu"],
-            extra_compile_args={"nvcc": ["--allow-unsupported-compiler"]}  # Add flag here
+            extra_compile_args={"nvcc": ["-O3"]} 
         )
     ],
     cmdclass={"build_ext": BuildExtension}
