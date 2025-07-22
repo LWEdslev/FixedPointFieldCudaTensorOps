@@ -4,12 +4,13 @@
 
 #define BLOCK_SIZE 8
 #define TILE_SIZE 8
-
+/*
 constexpr int64_t n64 = 8;
-constexpr int64_t p64 = (((int64_t)2) << 31) - 1;
+constexpr int64_t p64 = (((int64_t)1) << 31) - 1;
 
 constexpr int32_t n32 = 1;
-constexpr int32_t p32 = (((int32_t)2) << 13) - 1;
+constexpr int32_t p32 = (((int32_t)1) << 13) - 1;
+
 
 __global__ void field_matmul_i64_kernel(const int64_t* A, const int64_t* B, int64_t* C, int M, int N, int K) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -312,15 +313,138 @@ torch::Tensor benchmark_f32(torch::Tensor A, torch::Tensor B) {
 
     return C;
 }
+*/
+constexpr uint32_t P     = 0x7FFFFFFF;       
+constexpr uint64_t R     = 1ULL << 32;
+constexpr uint32_t P_inv = 2147483649;
+
+__global__ void matvec_fp16_shared_kernel(
+    const __half* __restrict__ A,
+    const __half* __restrict__ B,
+    __half* C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    __shared__ __half As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ __half Bs[BLOCK_SIZE];
+    if (row < M && col == 0) {
+        __half acc = __float2half(0.0f);
+
+        for (int tile = 0; tile < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++tile) {
+            int k = tile * BLOCK_SIZE + threadIdx.x;
+            if (row < M && k < K) {
+                As[threadIdx.y][threadIdx.x] = A[row * K + k];
+            } else {
+                As[threadIdx.y][threadIdx.x] = __float2half(0.0f);
+            }
+
+            if (k < K && threadIdx.y == 0) {
+                Bs[threadIdx.x] = B[k];
+            }
+            __syncthreads();
+
+            if (k < K) {
+                acc = __hfma(As[threadIdx.y][threadIdx.x], Bs[threadIdx.x], acc);
+            }
+
+            __syncthreads();
+        }
+
+        C[row] = acc;
+    }
+}
+
+
+
+__device__ __forceinline__ uint32_t montgomery_reduce(uint64_t T) {
+    uint32_t m = (uint32_t)(T * P_inv);  
+    uint64_t t = (T + (uint64_t)m * P) >> 32;
+    if (t >= P) t -= P;
+    return (uint32_t)t;
+}
+
+__global__ void montgomery_matvec_kernel(
+    const uint32_t* __restrict__ A,
+    const uint32_t* __restrict__ B,
+    uint32_t* C,
+    int M, int N, int K
+) {
+    __shared__ uint32_t sA[TILE_SIZE][TILE_SIZE];   
+    __shared__ uint32_t sB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    uint64_t acc = 0;
+
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int tiled_k = t * TILE_SIZE + threadIdx.x;
+        if (row < M && tiled_k < K)
+            sA[threadIdx.y][threadIdx.x] = A[row * K + tiled_k];
+        else
+            sA[threadIdx.y][threadIdx.x] = 0;
+        if (col < N && tiled_k < K)
+            sB[threadIdx.y][threadIdx.x] = B[tiled_k * N + col];
+        else
+            sB[threadIdx.y][threadIdx.x] = 0;
+
+        __syncthreads();
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            acc += (uint64_t)sA[threadIdx.y][k] * (uint64_t)sB[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = montgomery_reduce(acc);
+    }
+}
+
+__global__ void matvec_mod_kernel(
+    const uint32_t* __restrict__ A,
+    const uint32_t* __restrict__ B,
+    uint32_t* C,
+    int M, int N, int K
+) {
+    __shared__ uint32_t sA[TILE_SIZE][TILE_SIZE];
+    __shared__ uint32_t sB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    uint64_t acc = 0;
+
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int tiled_k = t * TILE_SIZE + threadIdx.x;
+
+        if (row < M && tiled_k < K)
+            sA[threadIdx.y][threadIdx.x] = A[row * K + tiled_k];
+        else
+            sA[threadIdx.y][threadIdx.x] = 0;
+
+        if (col < N && tiled_k < K)
+            sB[threadIdx.y][threadIdx.x] = B[tiled_k * N + col];
+        else
+            sB[threadIdx.y][threadIdx.x] = 0;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            acc += (uint64_t)sA[threadIdx.y][k] * (uint64_t)sB[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = (uint32_t)(acc % P);
+    }
+}
 
 /*
-fast-mod for rings
-bw := bitwidth
-x &= (1 << bw) - 1); 
-// (1 << bw) - 1) results in the lowest bw bits being 1
-
-*/
-
 torch::Tensor field_matmul_int64(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.device().is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.device().is_cuda(), "B must be a CUDA tensor");
@@ -419,7 +543,7 @@ torch::Tensor field_matmul_int32(torch::Tensor A, torch::Tensor B) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    field_matmul_i32_kernel_shared<<<gridDim, blockDim>>>(
+    montgomery_matvec_kernel<<<gridDim, blockDim>>>(
         A.data_ptr<int32_t>(),
         B.data_ptr<int32_t>(),
         C.data_ptr<int32_t>(),
@@ -476,14 +600,130 @@ torch::Tensor decode_from_field_int32(torch::Tensor A) {
 
     return output;
 }
+*/
+torch::Tensor montgomery_field_matmul_int32(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.device().is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.device().is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.scalar_type() == torch::kUInt32, "A must be uint32");
+    TORCH_CHECK(B.scalar_type() == torch::kUInt32, "B must be uint32");
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+
+    auto C = torch::empty({M, N}, torch::dtype(torch::kUInt32).device(A.device()));
+
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    montgomery_matvec_kernel<<<gridDim, blockDim>>>(
+        A.data_ptr<uint32_t>(),
+        B.data_ptr<uint32_t>(),
+        C.data_ptr<uint32_t>(),
+        M, N, K
+    );
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Montgomery matmul operation took %f ms\n", milliseconds);
+
+    return C;
+}
+
+torch::Tensor field_matmul_int32(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.device().is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.device().is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.scalar_type() == torch::kUInt32, "A must be uint32");
+    TORCH_CHECK(B.scalar_type() == torch::kUInt32, "B must be uint32");
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+
+    auto C = torch::empty({M, N}, torch::dtype(torch::kUInt32).device(A.device()));
+
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    matvec_mod_kernel<<<gridDim, blockDim>>>(
+        A.data_ptr<uint32_t>(),
+        B.data_ptr<uint32_t>(),
+        C.data_ptr<uint32_t>(),
+        M, N, K
+    );
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Modulos matmul operation took %f ms\n", milliseconds);
+
+    return C;
+}
+
+torch::Tensor matvec_fp16_shared(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.device().is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.device().is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
+    TORCH_CHECK(B.scalar_type() == torch::kHalf, "B must be float16");
+    TORCH_CHECK(B.dim() == 1, "B must be 1D vector");
+
+    int M = A.size(0);
+    int K = A.size(1);
+
+    auto C = torch::empty({M}, torch::dtype(torch::kHalf).device(A.device()));
+
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim(1, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    matvec_fp16_shared_kernel<<<gridDim, blockDim>>>(
+        reinterpret_cast<__half*>(A.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(B.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, 1, K
+    );
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("FP16 shared memory matvec took %f ms\n", milliseconds);
+
+    return C;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("field_matmul_int64", &field_matmul_int64, "Fixed point field Matrix multiplication (int64) on CUDA");
-    m.def("encode_to_field_int64", &encode_to_field_int64, "Encode (double) to field (int64) on CUDA");
-    m.def("decode_from_field_int64", &decode_from_field_int64, "Decode from field (int64) to double on CUDA");
-    m.def("field_matmul_int32", &field_matmul_int32, "Fixed point field Matrix multiplication (int32) on CUDA");
-    m.def("encode_to_field_int32", &encode_to_field_int32, "Encode (double) to field (int32) on CUDA");
-    m.def("decode_from_field_int32", &decode_from_field_int32, "Decode from field (int32) to double on CUDA");
-    m.def("benchmark_i32", &benchmark_i32, "benchmark i32 matrix multiplication (not field)");
-    m.def("benchmark_f32", &benchmark_f32, "benchmark f32 matrix multiplication (not field)");
+    //m.def("field_matmul_int64", &field_matmul_int64, "Fixed point field Matrix multiplication (int64) on CUDA");
+    //m.def("encode_to_field_int64", &encode_to_field_int64, "Encode (double) to field (int64) on CUDA");
+    //m.def("decode_from_field_int64", &decode_from_field_int64, "Decode from field (int64) to double on CUDA");
+    //m.def("field_matmul_int32", &field_matmul_int32, "Fixed point field Matrix multiplication (int32) on CUDA");
+    //m.def("encode_to_field_int32", &encode_to_field_int32, "Encode (double) to field (int32) on CUDA");
+    //m.def("decode_from_field_int32", &decode_from_field_int32, "Decode from field (int32) to double on CUDA");
+    //m.def("benchmark_i32", &benchmark_i32, "benchmark i32 matrix multiplication (not field)");
+    //m.def("benchmark_f32", &benchmark_f32, "benchmark f32 matrix multiplication (not field)");
+    m.def("montgomery_field_matmul_int32", &montgomery_field_matmul_int32, "i32 prime field multiplication using montomgery multiplication");
+    m.def("field_matmul_int32", &field_matmul_int32, "i32 prime field multiplication using modulos");
+    m.def("matvec_fp16_shared", &matvec_fp16_shared, "regular mat vec mult");
 }
